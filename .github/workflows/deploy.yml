@@ -1,165 +1,202 @@
-name: build-deploy-verify-student-crud
+name: Build Deploy Verify (EC2 Docker)
 
 on:
   push:
     branches: [main]
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 env:
   AWS_REGION: ap-south-1
-  ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
-  ECR_REPOSITORY: student
+  ECR_REPOSITORY_URI: 759204735992.dkr.ecr.ap-south-1.amazonaws.com/student
   EC2_INSTANCE_ID: i-05a6d3221095015b9
   PUBLIC_URL: http://52.66.14.67
   CONTAINER_PORT: "80"
+  DOCKER_CONTEXT: .
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
 jobs:
-  build:
-    name: Build diagnostics and Docker image
+  build-deploy-verify:
     runs-on: ubuntu-latest
-    outputs:
-      image_tag: ${{ steps.meta.outputs.image_tag }}
-      image_uri: ${{ steps.meta.outputs.image_uri }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build diagnostics - inventory repository evidence
+      - name: Inspect repository payload
         run: |
-          set -euo pipefail
-          echo "=== Repository inventory (PHP student CRUD app) ==="
+          echo "--- repository root ---"
           ls -la
-          echo "--- PHP files detected ---"
-          find . -maxdepth 2 -name '*.php' -type f | sort
-          echo "--- Static assets ---"
-          find . -maxdepth 2 -name '*.css' -type f | sort
-          echo "--- Shell scripts ---"
-          find . -maxdepth 2 -name '*.sh' -type f | sort
+          echo "--- PHP sources detected ---"
+          ls -l api.php connection.php login.php logout.php signup.php Dashboard.php userdashboard.php edit.php delete.php style.css || true
 
-      - name: Build diagnostics - PHP lint (if php CLI available)
+      - name: Ensure Dockerfile exists at repository root
         run: |
-          if command -v php >/dev/null 2>&1; then
-            for f in $(find . -maxdepth 2 -name '*.php' -type f); do
-              php -l "$f" || true
-            done
-          else
-            echo "php CLI not present on runner; skipping lint (container build will validate syntax)."
-          fi
-
-      - name: Build diagnostics - ensure Dockerfile exists for PHP Apache context
-        run: |
-          set -euo pipefail
           if [ ! -f Dockerfile ]; then
-            echo "No Dockerfile in repo; generating standard PHP Apache image wrapping repo context '.'"
-            cat > Dockerfile <<'DOCKERFILE'
+            echo "No Dockerfile committed - generating PHP Apache image definition"
+            cat > Dockerfile << 'DOCKERFILE'
             FROM php:8.2-apache
             RUN docker-php-ext-install mysqli && docker-php-ext-enable mysqli
             COPY . /var/www/html/
-            RUN chown -R www-data:www-data /var/www/html
             EXPOSE 80
-            CMD ["apache2-foreground"]
-          DOCKERFILE
+            DOCKERFILE
+            sed -i 's/^            //' Dockerfile
           fi
           echo "--- Dockerfile ---"
           cat Dockerfile
 
-      - name: Compute image tag and URI
-        id: meta
+      - name: Configure AWS credentials (static AWS CLI)
         run: |
-          set -euo pipefail
-          IMAGE_TAG="$(git rev-parse --short HEAD)-$(date -u +%Y%m%d%H%M%S)"
-          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
-          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
-          echo "image_uri=${FULL_IMAGE}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "FULL_IMAGE=$FULL_IMAGE" >> "$GITHUB_ENV"
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo "::error::AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY must be configured as repository secrets"
+            exit 1
+          fi
+          aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
+          aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
+          aws configure set region "$AWS_REGION"
+          aws configure set output json
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Amazon ECR (direct AWS CLI, static credentials)
+      - name: Compute image tag
+        id: vars
         run: |
-          set -euo pipefail
+          ECR_REGISTRY="${ECR_REPOSITORY_URI%/*}"
+          IMAGE_TAG="$(git rev-parse --short HEAD)-$(date -u +%Y%m%d%H%M%S)"
+          FULL_IMAGE="$ECR_REPOSITORY_URI:$IMAGE_TAG"
+          {
+            echo "ecr_registry=$ECR_REGISTRY"
+            echo "image_tag=$IMAGE_TAG"
+            echo "image_uri=$FULL_IMAGE"
+          } >> "$GITHUB_OUTPUT"
+          echo "ECR_REGISTRY=$ECR_REGISTRY"
+          echo "IMAGE_TAG=$IMAGE_TAG"
+          echo "IMAGE_URI=$FULL_IMAGE"
+
+      - name: ECR login (AWS CLI)
+        run: |
+          ECR_REGISTRY="${ECR_REPOSITORY_URI%/*}"
           aws ecr get-login-password --region "$AWS_REGION" \
             | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-      - name: Build Docker image (context '.', port 80)
+      - name: Build Docker image (diagnostics)
         run: |
-          set -euo pipefail
-          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
-          docker build -t "$FULL_IMAGE:${{ steps.meta.outputs.image_tag }}" -t "$FULL_IMAGE:latest" .
+          FULL_IMAGE="${{ steps.vars.outputs.image_uri }}"
+          docker buildx build \
+            --file Dockerfile \
+            --tag "$FULL_IMAGE" \
+            --progress plain \
+            --load \
+            "$DOCKER_CONTEXT"
 
-      - name: Push Docker image to ECR
+      - name: Build diagnostics - image inspection
         run: |
-          set -euo pipefail
-          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
-          docker push "$FULL_IMAGE:${{ steps.meta.outputs.image_tag }}"
-          docker push "$FULL_IMAGE:latest"
-
-      - name: Build diagnostics - image inspect
-        run: |
-          set -euo pipefail
-          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          FULL_IMAGE="${{ steps.vars.outputs.image_uri }}"
           docker images "$FULL_IMAGE"
-          docker inspect "$FULL_IMAGE:${{ steps.meta.outputs.image_tag }}" --format 'Image={{.Id}} ExposedPorts={{.Config.ExposedPorts}}'
+          docker history "$FULL_IMAGE"
+          docker inspect "$FULL_IMAGE" --format 'ExposedPorts: {{json .Config.ExposedPorts}} Cmd: {{json .Config.Cmd}}'
 
-  deploy:
-    name: Deploy to EC2 via SSM run-command
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Write SSM commands payload to JSON file
-        env:
-          IMAGE_URI: ${{ needs.build.outputs.image_uri }}
+      - name: Smoke test - serve container locally on port 80
         run: |
-          set -euo pipefail
+          FULL_IMAGE="${{ steps.vars.outputs.image_uri }}"
+          docker run -d --name smoke -p 80:80 "$FULL_IMAGE"
+          for i in $(seq 1 15); do
+            CODE=$(curl -s -o /tmp/smoke.html -w '%{http_code}' http://localhost:80/login.php || true)
+            [ "$CODE" = "200" ] && break
+            sleep 2
+          done
+          echo "local /login.php HTTP status: $CODE"
+          docker logs smoke || true
+          docker rm -f smoke >/dev/null
+          if [ "$CODE" != "200" ]; then
+            echo "::error::Local container smoke test failed (HTTP $CODE)"
+            exit 1
+          fi
+
+      - name: Push image to Amazon ECR
+        run: |
+          FULL_IMAGE="${{ steps.vars.outputs.image_uri }}"
+          docker push "$FULL_IMAGE"
+          docker tag "$FULL_IMAGE" "$ECR_REPOSITORY_URI:latest"
+          docker push "$ECR_REPOSITORY_URI:latest"
+
+      - name: Deploy to EC2 via SSM send-command
+        run: |
+          IMAGE_URI="${{ steps.vars.outputs.image_uri }}"
           cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
               "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 759204735992.dkr.ecr.ap-south-1.amazonaws.com",
-              "docker pull 759204735992.dkr.ecr.ap-south-1.amazonaws.com/student:IMAGE_TAG_PLACEHOLDER",
+              "docker pull 759204735992.dkr.ecr.ap-south-1.amazonaws.com/student:__IMAGE_TAG__",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app 759204735992.dkr.ecr.ap-south-1.amazonaws.com/student:IMAGE_TAG_PLACEHOLDER"
+              "docker run -d --restart always -p 80:80 --name app 759204735992.dkr.ecr.ap-south-1.amazonaws.com/student:__IMAGE_TAG__"
             ]
           }
           SSMPARAMS
-          sed -i "s|IMAGE_TAG_PLACEHOLDER|${IMAGE_TAG}|g" /tmp/ssm-params.json
+          sed -i "s|__IMAGE_TAG__|${{ steps.vars.outputs.image_tag }}|g" /tmp/ssm-params.json
           cat /tmp/ssm-params.json
-        shell: bash
-
-      - name: Send SSM command to EC2 instance
-        env:
-          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
-        run: |
-          set -euo pipefail
-          cat > /tmp/ssm-params.json << 'SSMPARAMS'
-          {
-            "commands": [
-              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 759204735992.dkr.ecr.ap-south-1.amazonaws.com",
-              "docker pull 759204735992.dkr.ecr.ap-south-1.amazonaws.com/student:IMGTAG",
-              "docker stop app || true",
-              "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app 759204735992.dkr.ecr.ap-south-1.amazonaws.com/student:IMGTAG"
-            ]
-          }
-          SSMPARAMS
-          sed -i "s|IMGTAG|${IMAGE_TAG}|g" /tmp/ssm-params.json
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$EC2_INSTANCE_ID" \
             --region "$AWS_REGION" \
             --document-name "AWS-RunShellScript" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
-          echo "COMMAND_ID=$COMMAND_ID" >> "$GITHUB_ENV"
-          echo "Dispatched SSM command: $COMMAND_ID"
-
-      - name: Wait for SSM command completion
-        run: |
-          set -euo pipefail
-          aws ssm wait command-executed \
+          echo "SSM command invoked: $COMMAND_ID"
+          STATUS=""
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --region "$AWS_REGION" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
+            echo "poll $i: $STATUS"
+            case "$STATUS" in
+              Success) break ;;
+              InProgress|Pending|Delayed) sleep 5 ;;
+              *) echo "::error::SSM command failed with status $STATUS"; exit 1 ;;
+            esac
+          done
+          [ "$STATUS" = "Success" ] || { echo "::error::SSM command did not succeed"; exit 1; }
+          aws ssm get-command-invocation \
             --command-id "$COMMAND_ID" \
+            --instance-id "$EC2_INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --query "StandardOutputContent" --output text || true
+
+      - name: Verify production health (HTTP 200 required)
+        run: |
+          CODE=""
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /tmp/health.html -w '%{http_code}' "$PUBLIC_URL/login.php" || true)
+            echo "attempt $i: /login.php -> $CODE"
+            [ "$CODE" = "200" ] && break
+            sleep 5
+          done
+          if [ "$CODE" != "200" ]; then
+            echo "::error::Production health check failed for $PUBLIC_URL/login.php (HTTP $CODE)"
+            exit 1
+          fi
+          ROOT_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_URL/" || true)
+          echo "root_url_status=$ROOT_CODE"
+          echo "HEALTH CHECK PASSED: $PUBLIC_URL/login.php returned HTTP 200"
+
+      - name: Deployment summary
+        if: success()
+        run: |
+          {
+            echo "### Deployment complete"
+            echo "- region: $AWS_REGION"
+            echo "- ecr_repo_url: $ECR_REPOSITORY_URI"
+            echo "- image: ${{ steps.vars.outputs.image_uri }}"
+            echo "- instance_id: $EC2_INSTANCE_ID"
+            echo "- public_ip: 52.66.14.67"
+            echo "- public_url: $PUBLIC_URL"
+            echo "- container_port: $CONTAINER_PORT"
+            echo "- security_group_id: sg-0f6f5c669dd0ec039"
+            echo "- iam_instance_profile: student-instance-profile"
+            echo "- iam_role: student-ec2-role"
+          } >> "$GITHUB_STEP_SUMMARY"
